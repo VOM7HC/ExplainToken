@@ -538,6 +538,10 @@ class Stage1TokenSHAP:
     
     Implements the base explainer using Monte Carlo sampling
     to estimate Shapley values for each token.
+    
+    Supports two Shapley estimation methods:
+    - 'simple': TokenSHAP-style averaging (E[v|i∈S] - E[v|i∉S])
+    - 'weighted': Proper Shapley weights based on coalition size
     """
     
     def __init__(
@@ -547,7 +551,9 @@ class Stage1TokenSHAP:
         coalition_strategy: CoalitionStrategy = CoalitionStrategy.DELETE,
         budget: int = 100,
         cache: Optional[CoalitionCache] = None,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        shapley_method: str = "weighted",  # "simple" or "weighted"
+        n_runs: int = 1  # Multi-run averaging for stability
     ):
         self.backend = backend
         self.value_function = value_function
@@ -555,6 +561,21 @@ class Stage1TokenSHAP:
         self.budget = budget
         self.cache = cache or CoalitionCache(use_cache=True)
         self.seed = seed
+        self.shapley_method = shapley_method
+        self.n_runs = n_runs
+    
+    def _compute_shapley_weights(self, n: int, s: int) -> float:
+        """
+        Compute proper Shapley weight for coalition of size s with n total players.
+        
+        Weight = s!(n-s-1)! / n!
+        
+        This ensures contributions from different sized coalitions are properly weighted.
+        """
+        from math import factorial
+        if s < 0 or s >= n:
+            return 0.0
+        return factorial(s) * factorial(n - s - 1) / factorial(n)
     
     def compute(self, prompt: str) -> Tuple[List[ShapleyResult], Dict[frozenset, CoalitionResult]]:
         """
@@ -615,7 +636,7 @@ class Stage1TokenSHAP:
             coalition_results[coalition] = result
             self.cache.set(coalition, result)
         
-        # Compute Shapley values using with/without averaging (TokenSHAP approach)
+        # Compute Shapley values using selected method
         shapley_results = []
         full_coalition = frozenset(range(n_tokens))
         full_payoff = coalition_results[full_coalition].payoff
@@ -625,12 +646,32 @@ class Stage1TokenSHAP:
             with_i = [c for c in coalition_results.keys() if i in c]
             without_i = [c for c in coalition_results.keys() if i not in c]
             
-            # Calculate averages
-            avg_with = np.mean([coalition_results[c].payoff for c in with_i]) if with_i else 0.0
-            avg_without = np.mean([coalition_results[c].payoff for c in without_i]) if without_i else 0.0
-            
-            # Shapley value estimate
-            shapley_value = avg_with - avg_without
+            if self.shapley_method == "weighted":
+                # Proper Shapley formula with coalition size weighting
+                # φ_i = Σ_{S⊆N\{i}} [s!(n-s-1)!/n!] * [v(S∪{i}) - v(S)]
+                shapley_value = 0.0
+                total_weight = 0.0
+                
+                for coalition_without in without_i:
+                    s = len(coalition_without)
+                    coalition_with = coalition_without | {i}
+                    
+                    if coalition_with in coalition_results:
+                        weight = self._compute_shapley_weights(n_tokens, s)
+                        v_with = coalition_results[coalition_with].payoff
+                        v_without = coalition_results[coalition_without].payoff
+                        shapley_value += weight * (v_with - v_without)
+                        total_weight += weight
+                
+                # Normalize if we don't have all coalitions
+                if total_weight > 0 and total_weight < 1.0:
+                    shapley_value = shapley_value / total_weight
+                    
+            else:  # "simple" method - TokenSHAP averaging
+                # Calculate simple averages
+                avg_with = np.mean([coalition_results[c].payoff for c in with_i]) if with_i else 0.0
+                avg_without = np.mean([coalition_results[c].payoff for c in without_i]) if without_i else 0.0
+                shapley_value = avg_with - avg_without
             
             # Calculate variance for stability analysis
             payoffs_with = [coalition_results[c].payoff for c in with_i]
@@ -652,6 +693,54 @@ class Stage1TokenSHAP:
             ))
         
         return shapley_results, coalition_results
+    
+    def compute_with_multirun(self, prompt: str) -> Tuple[List[ShapleyResult], Dict[frozenset, CoalitionResult]]:
+        """
+        Compute Shapley values with multi-run averaging for stability.
+        
+        Runs the computation n_runs times with different random seeds
+        and averages the results to reduce variance.
+        """
+        if self.n_runs <= 1:
+            return self.compute(prompt)
+        
+        all_values = []
+        final_coalition_results = None
+        tokens = None
+        
+        base_seed = self.seed if self.seed is not None else 42
+        
+        for run in range(self.n_runs):
+            # Use different seed for each run
+            self.seed = base_seed + run
+            shapley_results, coalition_results = self.compute(prompt)
+            
+            if tokens is None:
+                tokens = [r.token_text for r in shapley_results]
+            if final_coalition_results is None:
+                final_coalition_results = coalition_results
+            
+            all_values.append([r.shapley_value for r in shapley_results])
+        
+        # Average across runs
+        avg_values = np.mean(all_values, axis=0)
+        var_values = np.var(all_values, axis=0)
+        
+        # Create final results with averaged values
+        final_results = []
+        for i, (token, avg_val, var_val) in enumerate(zip(tokens, avg_values, var_values)):
+            final_results.append(ShapleyResult(
+                token_idx=i,
+                token_text=token,
+                shapley_value=float(avg_val),
+                variance=float(var_val),
+                leave_one_out_delta=shapley_results[i].leave_one_out_delta
+            ))
+        
+        # Restore original seed
+        self.seed = base_seed
+        
+        return final_results, final_coalition_results
 
 
 class Stage2SFARefinement:
@@ -877,6 +966,13 @@ class SFATokenSHAP:
     
     Combines TokenSHAP Monte Carlo estimation with SFA-style
     feature augmentation for improved token attribution.
+    
+    Key improvements over basic TokenSHAP:
+    - Semantic embedding-based value function (not TF-IDF)
+    - Proper Shapley weighting option
+    - SFA-style feature augmentation in Stage 2
+    - Stopword suppression
+    - Multi-run averaging for stability
     """
     
     def __init__(
@@ -887,7 +983,10 @@ class SFATokenSHAP:
         budget: int = 100,
         refiner_type: str = "ridge",
         use_cache: bool = True,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        shapley_method: str = "weighted",  # "simple" or "weighted"
+        n_runs: int = 1,  # Multi-run averaging
+        suppress_stopwords: bool = True  # Post-processing stopword suppression
     ):
         self.backend = backend
         self.value_function_type = value_function_type
@@ -896,8 +995,21 @@ class SFATokenSHAP:
         self.refiner_type = refiner_type
         self.use_cache = use_cache
         self.seed = seed
+        self.shapley_method = shapley_method
+        self.n_runs = n_runs
+        self.suppress_stopwords = suppress_stopwords
         
         self.cache = CoalitionCache(use_cache=use_cache)
+        
+        # Default stopwords for post-processing
+        self.stopwords = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+            'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
+            'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+            'could', 'should', 'may', 'might', 'must', 'shall', 'it', 'its', 'this',
+            'that', 'these', 'those', 'i', 'you', 'he', 'she', 'we', 'they', 'as',
+            'so', 'than', 'just', 'only', 'also', 'very', 'too', 'more', 'most'
+        }
     
     def explain(
         self,
@@ -934,10 +1046,16 @@ class SFATokenSHAP:
             coalition_strategy=self.coalition_strategy,
             budget=self.budget,
             cache=self.cache,
-            seed=self.seed
+            seed=self.seed,
+            shapley_method=self.shapley_method,
+            n_runs=self.n_runs
         )
         
-        stage1_results, coalition_results = stage1.compute(prompt)
+        # Use multi-run if configured
+        if self.n_runs > 1:
+            stage1_results, coalition_results = stage1.compute_with_multirun(prompt)
+        else:
+            stage1_results, coalition_results = stage1.compute(prompt)
         
         # Extract tokens and values
         tokens = [r.token_text for r in stage1_results]
@@ -968,6 +1086,21 @@ class SFATokenSHAP:
                 warnings.warn(f"Refiner training failed: {e}. Using heuristic refinement.")
         
         stage2_values = stage2.refine(feature_vectors, stage1_values)
+        
+        # Post-processing: Explicit stopword suppression (if enabled)
+        if self.suppress_stopwords:
+            for i, token in enumerate(tokens):
+                token_lower = token.lower().strip()
+                is_punct = all(c in ".,!?;:'-\"()[]{}/" for c in token.strip())
+                is_stop = token_lower in self.stopwords
+                is_whitespace = token.strip() == ""
+                
+                if is_stop or is_punct or is_whitespace:
+                    # Suppress trivial tokens by scaling down
+                    stage2_values[i] *= 0.3
+                    # Also apply threshold: if very small, zero out
+                    if abs(stage2_values[i]) < 0.01:
+                        stage2_values[i] = 0.0
         
         # Normalize if requested
         if normalize:
@@ -1069,6 +1202,7 @@ def compute_exact_shapley(
                     
                     # Marginal contribution
                     marginal = coalition_results[coalition_with_i].payoff - coalition_results[coalition].payoff
+                    
                     shapley_values[i] += weight * marginal
     
     return shapley_values
@@ -1121,6 +1255,115 @@ def sliding_window_shapley(
             attributions[i] /= counts[i]
     
     return attributions
+
+
+def group_tokens(
+    tokens: List[str],
+    attributions: np.ndarray,
+    groups: Optional[List[List[int]]] = None,
+    auto_detect_phrases: bool = False
+) -> Tuple[List[str], np.ndarray]:
+    """
+    Group tokens into phrases for more interpretable attributions.
+    
+    This addresses the review's suggestion to handle multi-word expressions
+    like "New York" as single units.
+    
+    Args:
+        tokens: List of token strings
+        attributions: Shapley values for each token
+        groups: Manual groupings as list of index lists [[0,1], [3,4,5], ...]
+                If None and auto_detect_phrases=True, attempts auto-detection
+        auto_detect_phrases: Whether to auto-detect common phrases
+        
+    Returns:
+        Tuple of (grouped_tokens, grouped_attributions)
+        
+    Example:
+        tokens = ["New", "York", "is", "great"]
+        attributions = [0.3, 0.4, 0.1, 0.5]
+        groups = [[0, 1]]  # Group "New" and "York"
+        
+        grouped_tokens, grouped_values = group_tokens(tokens, attributions, groups)
+        # Result: ["New York", "is", "great"], [0.7, 0.1, 0.5]
+    """
+    if groups is None and auto_detect_phrases:
+        # Simple heuristic: group capitalized adjacent tokens
+        groups = []
+        current_group = []
+        
+        for i, token in enumerate(tokens):
+            if token[0].isupper() if token else False:
+                current_group.append(i)
+            else:
+                if len(current_group) > 1:
+                    groups.append(current_group)
+                current_group = []
+        
+        if len(current_group) > 1:
+            groups.append(current_group)
+    
+    if not groups:
+        return tokens, attributions
+    
+    # Build mapping from original index to group
+    grouped_indices = set()
+    for group in groups:
+        grouped_indices.update(group)
+    
+    result_tokens = []
+    result_values = []
+    i = 0
+    
+    while i < len(tokens):
+        # Check if this index starts a group
+        group_found = None
+        for group in groups:
+            if group and group[0] == i:
+                group_found = group
+                break
+        
+        if group_found:
+            # Combine tokens and sum attributions
+            combined_token = " ".join(tokens[j] for j in group_found)
+            combined_value = sum(attributions[j] for j in group_found)
+            result_tokens.append(combined_token)
+            result_values.append(combined_value)
+            i = group_found[-1] + 1
+        else:
+            result_tokens.append(tokens[i])
+            result_values.append(attributions[i])
+            i += 1
+    
+    return result_tokens, np.array(result_values)
+
+
+def apply_importance_threshold(
+    attributions: np.ndarray,
+    threshold: float = 0.05,
+    mode: str = "zero"
+) -> np.ndarray:
+    """
+    Apply threshold to filter noise from attribution values.
+    
+    Args:
+        attributions: Shapley values
+        threshold: Minimum absolute value to keep
+        mode: "zero" to set below-threshold to 0, 
+              "relative" to use relative threshold based on max value
+              
+    Returns:
+        Filtered attributions
+    """
+    result = attributions.copy()
+    
+    if mode == "relative":
+        max_val = np.abs(attributions).max()
+        threshold = threshold * max_val
+    
+    result[np.abs(result) < threshold] = 0.0
+    
+    return result
 
 
 if __name__ == "__main__":
