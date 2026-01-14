@@ -235,9 +235,36 @@ class OllamaBackend(LLMBackend):
         return np.array(response["embedding"])
     
     def tokenize(self, text: str) -> List[str]:
-        """Simple whitespace tokenization (Ollama doesn't expose tokenizer)."""
-        # For more accurate tokenization, use HuggingFace tokenizer
-        return text.split()
+        """
+        Tokenize text with punctuation separation.
+        
+        Unlike simple whitespace splitting, this separates punctuation
+        from words for finer attribution granularity.
+        
+        Example: "Why is the sky blue?" -> ["Why", "is", "the", "sky", "blue", "?"]
+        """
+        import re
+        
+        # Pattern: split on whitespace but also separate punctuation
+        # This keeps punctuation as separate tokens
+        tokens = []
+        for word in text.split():
+            # Check if word ends with punctuation
+            if word and word[-1] in '.,!?;:"\')]:':
+                # Separate trailing punctuation
+                if len(word) > 1:
+                    tokens.append(word[:-1])
+                tokens.append(word[-1])
+            # Check if word starts with punctuation
+            elif word and word[0] in '"\'([':
+                tokens.append(word[0])
+                if len(word) > 1:
+                    tokens.append(word[1:])
+            else:
+                tokens.append(word)
+        
+        # Filter out empty tokens
+        return [t for t in tokens if t]
 
 
 class HuggingFaceBackend(LLMBackend):

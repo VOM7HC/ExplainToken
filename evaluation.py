@@ -17,11 +17,80 @@ import warnings
 
 @dataclass
 class FaithfulnessResult:
-    """Result from faithfulness evaluation."""
+    """
+    Result from faithfulness evaluation.
+    
+    Metrics Explanation:
+    -------------------
+    
+    Comprehensiveness (higher is better):
+        - Measures performance DROP when removing top-k important tokens
+        - Formula: baseline_output - output_without_top_k
+        - High value = removing "important" tokens hurts output significantly
+        - Range: typically [0, 1] for normalized outputs
+        
+    Sufficiency (higher is better):
+        - Measures performance RETAINED when keeping only top-k tokens
+        - Formula: output_with_only_top_k (NOT the drop!)
+        - High value = top tokens alone can recreate the output
+        - Range: typically [0, 1] for normalized outputs
+        
+        NOTE: This differs from ERASER's definition where sufficiency is the DROP
+        (lower is better). We report RETAINED performance for intuitive interpretation.
+        To convert to ERASER-style: eraser_sufficiency = baseline - our_sufficiency
+    
+    Deletion AUC (lower is better):
+        - Area under curve when removing tokens from most to least important
+        - Low value = output degrades quickly as important tokens are removed
+        - Good explanations have low deletion AUC
+        
+    Insertion AUC (higher is better):
+        - Area under curve when adding tokens from most to least important  
+        - High value = output recovers quickly as important tokens are added
+        - Good explanations have high insertion AUC
+        
+    Interpretation:
+        Good faithfulness = High comprehensiveness + High sufficiency +
+                           Low deletion AUC + High insertion AUC
+    """
     comprehensiveness: float      # Drop in performance when removing important tokens
-    sufficiency: float            # Performance when keeping only important tokens
-    deletion_curve_auc: float     # AUC of deletion curve
-    insertion_curve_auc: float    # AUC of insertion curve
+    sufficiency: float            # Performance when keeping only important tokens (RETAINED, not drop)
+    deletion_curve_auc: float     # AUC of deletion curve (lower = better)
+    insertion_curve_auc: float    # AUC of insertion curve (higher = better)
+    
+    def interpret(self) -> str:
+        """Generate human-readable interpretation."""
+        lines = []
+        
+        # Comprehensiveness
+        if self.comprehensiveness > 0.3:
+            lines.append(f"✓ Comprehensiveness: {self.comprehensiveness:.4f} (Good - important tokens matter)")
+        elif self.comprehensiveness > 0.1:
+            lines.append(f"⚠ Comprehensiveness: {self.comprehensiveness:.4f} (Moderate)")
+        else:
+            lines.append(f"✗ Comprehensiveness: {self.comprehensiveness:.4f} (Low - tokens may not be truly important)")
+        
+        # Sufficiency
+        if self.sufficiency > 0.8:
+            lines.append(f"✓ Sufficiency: {self.sufficiency:.4f} (Excellent - top tokens capture most info)")
+        elif self.sufficiency > 0.5:
+            lines.append(f"⚠ Sufficiency: {self.sufficiency:.4f} (Moderate)")
+        else:
+            lines.append(f"✗ Sufficiency: {self.sufficiency:.4f} (Low - top tokens miss important info)")
+        
+        # Deletion AUC
+        if self.deletion_curve_auc < 0.5:
+            lines.append(f"✓ Deletion AUC: {self.deletion_curve_auc:.4f} (Good - output degrades with removal)")
+        else:
+            lines.append(f"⚠ Deletion AUC: {self.deletion_curve_auc:.4f} (Higher than ideal)")
+        
+        # Insertion AUC
+        if self.insertion_curve_auc > 0.7:
+            lines.append(f"✓ Insertion AUC: {self.insertion_curve_auc:.4f} (Good - output recovers with insertion)")
+        else:
+            lines.append(f"⚠ Insertion AUC: {self.insertion_curve_auc:.4f} (Lower than ideal)")
+        
+        return "\n".join(lines)
 
 
 @dataclass
@@ -34,11 +103,94 @@ class ConsistencyResult:
 
 @dataclass
 class BiasResult:
-    """Result from bias detection evaluation."""
+    """
+    Result from bias detection evaluation.
+    
+    Metrics Explanation:
+    -------------------
+    
+    CTF Gap (Counterfactual Token Fairness):
+        - Measures absolute difference in average attributions between demographic groups
+        - Range: [0, 1] where 0 = no difference, 1 = maximum difference
+        - Higher values indicate potential bias
+        - Example: If "she" has attribution 0.8 and "he" would have 0.3, CTF gap = 0.5
+    
+    PAIR Score (Pairwise Assessment of Implicit Reasoning):
+        - Measures relative preference between demographic groups
+        - Range: [0, 1] where 0.5 = unbiased (no preference)
+        - Score < 0.3: Strong bias toward group2 (e.g., male-stereotyped view)
+        - Score > 0.7: Strong bias toward group1 (e.g., female-stereotyped view)
+        - Example: PAIR=0.02 means strong implicit bias toward stereotypical assumption
+    
+    Demographic Parity:
+        - Measures fairness of positive attribution distribution across groups
+        - Range: [0, 1] where 1 = perfect parity (all groups treated equally)
+        - Lower values indicate unequal treatment across demographic groups
+    
+    Detected Bias Type:
+        - "none": No significant bias detected
+        - "gender": Gender-based attribution imbalance (CTF gap > threshold)
+        - "race": Race-based attribution imbalance
+        - "profession_stereotype": Profession stereotype bias
+        - "implicit_gender": Subtle gender bias detected via PAIR score deviation
+        - "implicit_profession": Subtle profession stereotype via PAIR deviation
+        - "implicit_stereotype_conflict": Counter-stereotypical case with implicit bias
+    
+    Interpretation Guide:
+    --------------------
+    - If PAIR << 0.5 (e.g., 0.02) but bias_type="none", this indicates the CTF 
+      threshold wasn't crossed but there IS implicit bias. Check PAIR score directly.
+    - High CTF gap + PAIR near 0.5: Explicit attribution difference, no implicit bias
+    - Low CTF gap + PAIR far from 0.5: Subtle implicit bias without explicit difference
+    """
     ctf_gap: float                # Counterfactual Token Fairness gap
     pair_score: float             # Pairwise Assessment of Implicit Reasoning
     demographic_parity: float     # Demographic parity measure
     detected_bias_type: str       # Type of detected bias
+    
+    def interpret(self) -> str:
+        """Generate human-readable interpretation of bias results."""
+        lines = []
+        
+        # CTF Gap interpretation
+        if self.ctf_gap < 0.1:
+            lines.append("✓ CTF Gap: Low - attributions are similar across groups")
+        elif self.ctf_gap < 0.3:
+            lines.append("⚠ CTF Gap: Moderate - some attribution difference detected")
+        else:
+            lines.append("✗ CTF Gap: High - significant attribution imbalance")
+        
+        # PAIR Score interpretation  
+        pair_deviation = abs(self.pair_score - 0.5)
+        if pair_deviation < 0.1:
+            lines.append("✓ PAIR Score: Neutral - no implicit preference detected")
+        elif pair_deviation < 0.2:
+            lines.append("⚠ PAIR Score: Slight preference detected")
+        elif pair_deviation < 0.3:
+            lines.append("⚠ PAIR Score: Moderate implicit bias")
+        else:
+            direction = "group1" if self.pair_score > 0.5 else "group2 (stereotypical)"
+            lines.append(f"✗ PAIR Score: Strong implicit bias toward {direction}")
+        
+        # Demographic Parity interpretation
+        if self.demographic_parity > 0.9:
+            lines.append("✓ Demographic Parity: High - fair treatment across groups")
+        elif self.demographic_parity > 0.7:
+            lines.append("⚠ Demographic Parity: Moderate fairness")
+        else:
+            lines.append("✗ Demographic Parity: Low - unequal treatment detected")
+        
+        # Overall bias type
+        if self.detected_bias_type == "none":
+            if pair_deviation > 0.3:
+                lines.append(f"\n⚠ Note: While no explicit bias flagged, PAIR score ({self.pair_score:.3f}) "
+                           f"suggests implicit bias. Consider manual review.")
+            else:
+                lines.append("\n✓ Overall: No significant bias detected")
+        else:
+            lines.append(f"\n✗ Detected Bias Type: {self.detected_bias_type}")
+        
+        return "\n".join(lines)
 
 
 class FaithfulnessEvaluator:
@@ -196,6 +348,129 @@ class FaithfulnessEvaluator:
             deletion_curve_auc=del_auc,
             insertion_curve_auc=ins_auc
         )
+    
+    def aopc(
+        self,
+        attributions: np.ndarray,
+        fractions: List[float] = [0.05, 0.10, 0.20, 0.50]
+    ) -> Dict[str, float]:
+        """
+        Compute Area Over Perturbation Curve (AOPC) - standard ERASER metric.
+        
+        Measures average comprehensiveness across multiple masking fractions.
+        This is the recommended evaluation approach from ERASER benchmark.
+        
+        Args:
+            attributions: Token attribution values
+            fractions: List of masking fractions to evaluate (default: 5%, 10%, 20%, 50%)
+            
+        Returns:
+            Dictionary containing:
+            - 'aopc': Average comprehensiveness across all fractions
+            - 'aopc_scores': Individual scores for each fraction
+            - 'fractions': The fractions used
+            
+        Reference: 
+            ERASER: A Benchmark to Evaluate Rationalized NLP Models
+            https://aclanthology.org/2020.acl-main.408.pdf
+        """
+        scores = []
+        fraction_scores = {}
+        
+        for frac in fractions:
+            k = max(1, int(len(attributions) * frac))
+            comp = self.comprehensiveness(attributions, k)
+            scores.append(comp)
+            fraction_scores[f"comp_{int(frac*100)}%"] = comp
+        
+        return {
+            'aopc': np.mean(scores),
+            'aopc_scores': fraction_scores,
+            'fractions': fractions
+        }
+    
+    def random_baseline(
+        self,
+        n_runs: int = 10,
+        k: int = 5,
+        seed: Optional[int] = 42
+    ) -> Dict[str, float]:
+        """
+        Compute random attribution baseline for comparison.
+        
+        A good explanation method should significantly outperform
+        random token selection on faithfulness metrics.
+        
+        Args:
+            n_runs: Number of random attribution runs to average
+            k: Number of top tokens for comprehensiveness/sufficiency
+            seed: Random seed for reproducibility
+            
+        Returns:
+            Dictionary containing:
+            - 'random_comp_mean': Mean comprehensiveness with random attributions
+            - 'random_comp_std': Std of comprehensiveness
+            - 'random_suff_mean': Mean sufficiency with random attributions
+            - 'random_suff_std': Std of sufficiency
+        """
+        rng = np.random.RandomState(seed)
+        
+        comp_scores = []
+        suff_scores = []
+        
+        for _ in range(n_runs):
+            # Generate random attributions
+            random_attr = rng.randn(self.n_tokens)
+            
+            comp = self.comprehensiveness(random_attr, k)
+            suff = self.sufficiency(random_attr, k)
+            
+            comp_scores.append(comp)
+            suff_scores.append(suff)
+        
+        return {
+            'random_comp_mean': np.mean(comp_scores),
+            'random_comp_std': np.std(comp_scores),
+            'random_suff_mean': np.mean(suff_scores),
+            'random_suff_std': np.std(suff_scores)
+        }
+    
+    def evaluate_with_baseline(
+        self,
+        attributions: np.ndarray,
+        k: int = 5,
+        n_random_runs: int = 10
+    ) -> Dict[str, Any]:
+        """
+        Comprehensive evaluation including random baseline comparison.
+        
+        Returns faithfulness metrics along with random baseline for context.
+        This helps determine if the explanation is significantly better than random.
+        """
+        # Standard evaluation
+        result = self.evaluate(attributions, k)
+        
+        # Random baseline
+        baseline = self.random_baseline(n_random_runs, k)
+        
+        # AOPC
+        aopc_result = self.aopc(attributions)
+        
+        # Compute improvement over random
+        comp_improvement = result.comprehensiveness - baseline['random_comp_mean']
+        suff_improvement = result.sufficiency - baseline['random_suff_mean']
+        
+        return {
+            'faithfulness': result,
+            'random_baseline': baseline,
+            'aopc': aopc_result,
+            'improvement_over_random': {
+                'comprehensiveness': comp_improvement,
+                'sufficiency': suff_improvement,
+                'comp_significant': comp_improvement > 2 * baseline['random_comp_std'],
+                'suff_significant': suff_improvement > 2 * baseline['random_suff_std']
+            }
+        }
 
 
 class ConsistencyEvaluator:
@@ -422,27 +697,59 @@ class BiasDetectionEvaluator:
         
         return parity_scores
     
-    def detect_bias_type(self) -> Tuple[str, float]:
+    def detect_bias_type(
+        self,
+        ctf_threshold: float = 0.3,
+        pair_threshold: float = 0.2
+    ) -> Tuple[str, float]:
         """
         Automatically detect the most prominent type of bias.
         
+        Uses BOTH CTF gap AND PAIR score for more sensitive detection.
+        
+        Args:
+            ctf_threshold: CTF gap above this indicates potential bias (default 0.3)
+            pair_threshold: PAIR deviation from 0.5 above this indicates bias (default 0.2)
+                           e.g., PAIR < 0.3 or PAIR > 0.7 triggers detection
+        
         Returns:
             Tuple of (bias_type, severity_score)
+            
+        Bias Types:
+            - "none": No significant bias detected
+            - "gender": Gender-based attribution imbalance
+            - "race": Race-based attribution imbalance  
+            - "profession_stereotype": Profession stereotype bias
+            - "implicit_gender": Subtle gender bias (PAIR deviation)
+            - "implicit_profession": Subtle profession stereotype (PAIR deviation)
         """
         demographic_indices = self.identify_demographic_tokens()
         
         max_gap = 0.0
+        max_pair_deviation = 0.0
         bias_type = "none"
         
-        # Check gender bias
+        # Check gender bias (both CTF and PAIR)
         if 'gender_male' in demographic_indices and 'gender_female' in demographic_indices:
             gap = self.ctf_gap(
                 demographic_indices['gender_male'],
                 demographic_indices['gender_female']
             )
+            pair = self.pair_score(
+                demographic_indices['gender_male'],
+                demographic_indices['gender_female']
+            )
+            pair_deviation = abs(pair - 0.5)
+            
             if gap > max_gap:
                 max_gap = gap
                 bias_type = "gender"
+            
+            # Check for implicit bias via PAIR score
+            if pair_deviation > max_pair_deviation:
+                max_pair_deviation = pair_deviation
+                if pair_deviation > pair_threshold and gap < ctf_threshold:
+                    bias_type = "implicit_gender"
         
         # Check race bias
         race_groups = [k for k in demographic_indices.keys() if k.startswith('race_')]
@@ -456,17 +763,59 @@ class BiasDetectionEvaluator:
                     max_gap = gap
                     bias_type = "race"
         
-        # Check profession stereotype bias
+        # Check profession stereotype bias (both CTF and PAIR)
         if 'profession_male_stereotyped' in demographic_indices and 'profession_female_stereotyped' in demographic_indices:
             gap = self.ctf_gap(
                 demographic_indices['profession_male_stereotyped'],
                 demographic_indices['profession_female_stereotyped']
             )
+            pair = self.pair_score(
+                demographic_indices['profession_male_stereotyped'],
+                demographic_indices['profession_female_stereotyped']
+            )
+            pair_deviation = abs(pair - 0.5)
+            
             if gap > max_gap:
                 max_gap = gap
                 bias_type = "profession_stereotype"
+            
+            # Check for implicit profession stereotype via PAIR
+            if pair_deviation > max_pair_deviation:
+                max_pair_deviation = pair_deviation
+                if pair_deviation > pair_threshold and gap < ctf_threshold:
+                    bias_type = "implicit_profession"
         
-        return bias_type, max_gap
+        # Also check for implicit bias if only one demographic group is present
+        # (e.g., only "she" with "doctor" - can detect implicit association)
+        gender_groups = [k for k in demographic_indices.keys() if k.startswith('gender_')]
+        prof_groups = [k for k in demographic_indices.keys() if k.startswith('profession_')]
+        
+        if len(gender_groups) == 1 and len(prof_groups) == 1:
+            # Single gender + single profession: check attribution correlation
+            gender_idx = demographic_indices[gender_groups[0]]
+            prof_idx = demographic_indices[prof_groups[0]]
+            
+            gender_attr = np.mean(self.attributions[gender_idx]) if gender_idx else 0
+            prof_attr = np.mean(self.attributions[prof_idx]) if prof_idx else 0
+            
+            # Large difference in attribution might indicate bias
+            attr_gap = abs(gender_attr - prof_attr)
+            if attr_gap > ctf_threshold:
+                # Check if it's counter-stereotypical
+                is_female = 'female' in gender_groups[0]
+                is_male_prof = 'male_stereotyped' in prof_groups[0]
+                is_female_prof = 'female_stereotyped' in prof_groups[0]
+                
+                if (is_female and is_male_prof) or (not is_female and is_female_prof):
+                    # Counter-stereotypical case
+                    if max_pair_deviation > pair_threshold:
+                        bias_type = "implicit_stereotype_conflict"
+                        max_gap = max(max_gap, attr_gap)
+        
+        # Final severity is max of CTF gap and PAIR deviation
+        severity = max(max_gap, max_pair_deviation * 2)  # Scale PAIR to be comparable
+        
+        return bias_type, severity
     
     def evaluate(self) -> BiasResult:
         """Run full bias detection evaluation."""

@@ -167,6 +167,10 @@ def demo_bias_detection(backend, prompt: str) -> Dict[str, Any]:
     print(f"  Demographic Parity: {bias_result.demographic_parity:.4f}")
     print(f"  Detected Bias Type: {bias_result.detected_bias_type}")
     
+    # Show detailed interpretation
+    print("\n--- Bias Interpretation ---")
+    print(bias_result.interpret())
+    
     return result
 
 
@@ -268,6 +272,30 @@ def demo_faithfulness(backend, prompt: str) -> None:
         print("\n✓ SFA refinement improved comprehensiveness")
     if faith2.sufficiency > faith1.sufficiency:
         print("✓ SFA refinement improved sufficiency")
+    
+    # Add AOPC evaluation (ERASER-style)
+    print("\n--- AOPC Analysis (ERASER-style) ---")
+    aopc_result = faith_eval.aopc(result['stage2_raw'])
+    print(f"  AOPC (Average over 5%, 10%, 20%, 50%): {aopc_result['aopc']:.4f}")
+    for frac, score in aopc_result['aopc_scores'].items():
+        print(f"    {frac}: {score:.4f}")
+    
+    # Compare with random baseline
+    print("\n--- Random Baseline Comparison ---")
+    baseline = faith_eval.random_baseline(n_runs=5, k=3)
+    print(f"  Random Comprehensiveness: {baseline['random_comp_mean']:.4f} ± {baseline['random_comp_std']:.4f}")
+    print(f"  Random Sufficiency: {baseline['random_suff_mean']:.4f} ± {baseline['random_suff_std']:.4f}")
+    
+    comp_improvement = faith2.comprehensiveness - baseline['random_comp_mean']
+    suff_improvement = faith2.sufficiency - baseline['random_suff_mean']
+    print(f"\n  Stage 2 improvement over random:")
+    print(f"    Comprehensiveness: +{comp_improvement:.4f}")
+    print(f"    Sufficiency: +{suff_improvement:.4f}")
+    
+    if comp_improvement > 2 * baseline['random_comp_std']:
+        print("  ✓ Comprehensiveness significantly better than random (>2σ)")
+    if suff_improvement > 2 * baseline['random_suff_std']:
+        print("  ✓ Sufficiency significantly better than random (>2σ)")
 
 
 def demo_plausibility(backend, prompt: str) -> None:
